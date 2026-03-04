@@ -714,6 +714,12 @@ class Config:
         self.session_id = None
         self.list_sessions = False
         self.cwd = os.getcwd()
+        # Provider options (ollama | openrouter | vertexai | openai-compat)
+        self.provider = "ollama"
+        self.api_key = ""
+        self.base_url = ""  # custom base URL for openai-compat provider
+        self.vertexai_project = ""
+        self.vertexai_location = "us-central1"
         # RAG options
         self.rag = False
         self.rag_mode = "query"
@@ -746,8 +752,15 @@ class Config:
         self._load_config_file()
         self._load_env()
         self._load_cli_args(argv)
-        self._auto_detect_model()
-        self._validate_ollama_host()
+        if self.provider == "ollama":
+            self._auto_detect_model()
+            self._validate_ollama_host()
+        elif not self.model:
+            # Cloud providers require explicit model name
+            if self.provider == "openrouter":
+                self.model = "qwen/qwen-2.5-coder-32b-instruct"
+            elif self.provider == "vertexai":
+                self.model = "qwen/qwen3-coder-480b-a35b-instruct-maas"
         self._ensure_dirs()
         return self
 
@@ -801,6 +814,17 @@ class Config:
                             self.context_window = int(val)
                         except ValueError:
                             pass
+                    # Provider settings
+                    elif key == "PROVIDER" and val:
+                        self.provider = val.lower()
+                    elif key == "API_KEY" and val:
+                        self.api_key = val
+                    elif key == "BASE_URL" and val:
+                        self.base_url = val
+                    elif key == "VERTEXAI_PROJECT" and val:
+                        self.vertexai_project = val
+                    elif key == "VERTEXAI_LOCATION" and val:
+                        self.vertexai_location = val
         except (OSError, IOError):
             pass  # Config file unreadable — skip silently
 
@@ -818,6 +842,19 @@ class Config:
             self.sidecar_model = os.environ["VIBE_LOCAL_SIDECAR_MODEL"]
         if os.environ.get("VIBE_CODER_DEBUG") == "1" or os.environ.get("VIBE_LOCAL_DEBUG") == "1":
             self.debug = True
+        # Provider settings from env
+        if os.environ.get("VIBE_LOCAL_PROVIDER"):
+            self.provider = os.environ["VIBE_LOCAL_PROVIDER"].lower()
+        if os.environ.get("OPENROUTER_API_KEY"):
+            self.api_key = os.environ["OPENROUTER_API_KEY"]
+        if os.environ.get("VIBE_LOCAL_API_KEY"):
+            self.api_key = os.environ["VIBE_LOCAL_API_KEY"]
+        if os.environ.get("VIBE_LOCAL_BASE_URL"):
+            self.base_url = os.environ["VIBE_LOCAL_BASE_URL"]
+        if os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            self.vertexai_project = os.environ["GOOGLE_CLOUD_PROJECT"]
+        if os.environ.get("VERTEXAI_LOCATION"):
+            self.vertexai_location = os.environ["VERTEXAI_LOCATION"]
 
     def _load_cli_args(self, argv=None):
         # Strip full-width spaces from args (common with Japanese IME input)
@@ -854,6 +891,14 @@ class Config:
         parser.add_argument("--version", action="version", version=f"vibe-coder {__version__}")
         parser.add_argument("--dangerously-skip-permissions", action="store_true",
                             help="Alias for -y (compatibility)")
+        # Provider options
+        parser.add_argument("--provider",
+                            choices=["ollama", "openrouter", "vertexai", "openai-compat"],
+                            help="LLM provider (default: ollama)")
+        parser.add_argument("--api-key", help="API key (OpenRouter or generic)")
+        parser.add_argument("--base-url", help="Custom base URL for openai-compat provider")
+        parser.add_argument("--vertexai-project", help="GCP project ID for VertexAI")
+        parser.add_argument("--vertexai-location", help="GCP region for VertexAI (default: us-south1)")
         # RAG options
         parser.add_argument("--rag", action="store_true", help="Enable RAG mode")
         parser.add_argument("--rag-mode", choices=["query"], default="query",
@@ -890,6 +935,17 @@ class Config:
             self.temperature = args.temperature
         if args.context_window is not None:
             self.context_window = args.context_window
+        # Provider args
+        if args.provider:
+            self.provider = args.provider
+        if args.api_key:
+            self.api_key = args.api_key
+        if args.base_url:
+            self.base_url = args.base_url
+        if args.vertexai_project:
+            self.vertexai_project = args.vertexai_project
+        if args.vertexai_location:
+            self.vertexai_location = args.vertexai_location
         # RAG args
         if args.rag:
             self.rag = True
@@ -1401,7 +1457,524 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
 # OllamaClient — Direct communication with Ollama OpenAI-compatible API
 # ════════════════════════════════════════════════════════════════════════════════
 
-class OllamaClient:
+class LLMClient(ABC):
+    """LLM provider abstract interface.
+
+    All methods return OpenAI Chat Completions API compatible format.
+    Subclasses must implement chat, chat_sync, check_connection, check_model.
+    """
+
+    @abstractmethod
+    def chat(self, model, messages, tools=None, stream=True):
+        """Send chat request.
+        stream=True: yields OpenAI delta format chunks (generator)
+        stream=False: returns OpenAI compatible dict
+        """
+        ...
+
+    @abstractmethod
+    def chat_sync(self, model, messages, tools=None):
+        """Synchronous chat. Returns: {"content": str, "tool_calls": list}"""
+        ...
+
+    @abstractmethod
+    def check_connection(self, retries=3):
+        """Check connectivity. Returns: (ok: bool, models: list[str])"""
+        ...
+
+    @abstractmethod
+    def check_model(self, model_name, available_models=None):
+        """Check if model is available."""
+        ...
+
+    def tokenize(self, model, text):
+        """Estimate token count. Default: len(text) // 4"""
+        return len(text) // 4
+
+    def pull_model(self, model_name):
+        """Download model. Only local providers implement this."""
+        raise NotImplementedError("This provider does not support model pulling")
+
+    def detect_tool_streaming(self):
+        """Check if provider supports streaming with tool calls. Default: True"""
+        return True
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# OpenAI-Compatible Provider Base
+# ════════════════════════════════════════════════════════════════════════════════
+
+class OpenAICompatClient(LLMClient):
+    """Base class for OpenAI Chat Completions API compatible providers.
+
+    Handles /v1/chat/completions, SSE streaming, and tool_calls parsing.
+    Uses only urllib.request (zero external dependencies).
+    """
+
+    def __init__(self, base_url, api_key=None, default_model="",
+                 extra_headers=None, max_tokens=8192, temperature=0.7,
+                 context_window=32768, timeout=300, debug=False):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.default_model = default_model
+        self.extra_headers = extra_headers or {}
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.context_window = context_window
+        self.timeout = timeout
+        self.debug = debug
+
+    def _build_headers(self):
+        """Build request headers. Subclasses can override for custom auth."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.extra_headers)
+        return headers
+
+    def chat(self, model, messages, tools=None, stream=True):
+        """Send chat request to OpenAI-compatible endpoint."""
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": model or self.default_model,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": stream,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        headers = self._build_headers()
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+        if self.debug:
+            print(f"{C.DIM}[debug] POST {url} model={payload['model']} "
+                  f"msgs={len(messages)} tools={len(tools or [])} "
+                  f"stream={stream}{C.RESET}", file=sys.stderr)
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            status_code = e.code
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            finally:
+                e.close()
+            if status_code == 401:
+                raise RuntimeError(f"Authentication failed (401). Check your API key. {error_body[:200]}") from e
+            elif status_code == 429:
+                raise RuntimeError(f"Rate limited (429). Try again later. {error_body[:200]}") from e
+            else:
+                raise RuntimeError(f"HTTP error {status_code}: {error_body}") from e
+
+        if stream:
+            return self._iter_sse(resp)
+        else:
+            try:
+                raw = resp.read(10 * 1024 * 1024)
+            finally:
+                resp.close()
+            data = json.loads(raw)
+            if self.debug:
+                usage = data.get("usage", {})
+                print(f"{C.DIM}[debug] Response: prompt={usage.get('prompt_tokens', 0)} "
+                      f"completion={usage.get('completion_tokens', 0)}{C.RESET}", file=sys.stderr)
+            return data
+
+    def _iter_sse(self, resp):
+        """Parse SSE (Server-Sent Events) stream.
+        Format: data: {...}\\n\\n with data: [DONE] as terminator.
+        Yields OpenAI delta format chunks."""
+        buf = b""
+        MAX_BUF = 1024 * 1024
+        try:
+            while True:
+                try:
+                    chunk = resp.read(4096)
+                except (ConnectionError, OSError, urllib.error.URLError) as e:
+                    if self.debug:
+                        print(f"\n{C.YELLOW}[debug] SSE stream read error: {e}{C.RESET}",
+                              file=sys.stderr)
+                    break
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_BUF and b"\n" not in buf:
+                    buf = b""
+                    continue
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue  # SSE comment (e.g. ": OPENROUTER PROCESSING")
+                    if line == "data: [DONE]":
+                        return
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        yield data
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def chat_sync(self, model, messages, tools=None):
+        """Synchronous chat returning normalized dict."""
+        resp = self.chat(model=model, messages=messages, tools=tools, stream=False)
+        choice = resp.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content", "") or ""
+
+        # Strip <think>...</think> blocks (reasoning traces)
+        content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+
+        tool_calls = []
+        for tc in message.get("tool_calls", []):
+            func = tc.get("function", {})
+            tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+            raw_args = func.get("arguments", "{}")
+            if isinstance(raw_args, str) and len(raw_args) > 102400:
+                raw_args = raw_args[:102400]
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                if not isinstance(args, dict):
+                    args = {"raw": str(args)}
+            except json.JSONDecodeError:
+                try:
+                    fixed = raw_args.replace("'", '"')
+                    fixed = re.sub(r',\s*}', '}', fixed)
+                    fixed = re.sub(r',\s*]', ']', fixed)
+                    args = json.loads(fixed)
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    args = {"raw": raw_args}
+            tool_calls.append({"id": tc_id, "name": func.get("name", ""), "arguments": args})
+
+        return {"content": content, "tool_calls": tool_calls}
+
+    def check_connection(self, retries=3):
+        """Check connectivity. Tries /models endpoint."""
+        for attempt in range(retries):
+            try:
+                url = f"{self.base_url}/models"
+                req = urllib.request.Request(url, headers=self._build_headers())
+                resp = urllib.request.urlopen(req, timeout=10)
+                try:
+                    data = json.loads(resp.read(10 * 1024 * 1024))
+                finally:
+                    resp.close()
+                models = [m["id"] for m in data.get("data", [])]
+                return True, models
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
+                return True, [self.default_model]
+
+    def check_model(self, model_name, available_models=None):
+        """Cloud APIs always return True (runtime error if invalid)."""
+        return True
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# OpenRouter Provider
+# ════════════════════════════════════════════════════════════════════════════════
+
+class OpenRouterClient(OpenAICompatClient):
+    """OpenRouter-specific handling.
+
+    For models without native tool calling support (e.g. qwen-2.5-coder-32b),
+    injects tool definitions as XML into the system prompt and relies on
+    _extract_tool_calls_from_text() for parsing.
+    """
+
+    TOOL_CAPABLE_PREFIXES = {
+        "qwen/qwen3-", "anthropic/claude-", "openai/gpt-",
+        "google/gemini-", "meta-llama/llama-3.3-",
+    }
+
+    def __init__(self, api_key, model, **kwargs):
+        super().__init__(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            default_model=model,
+            extra_headers={
+                "HTTP-Referer": "https://github.com/keishimizu26629/vibe-local",
+                "X-OpenRouter-Title": "vibe-local",
+            },
+            **kwargs
+        )
+
+    def _model_supports_tools(self, model):
+        """Check if model supports tool calling at API level."""
+        return any(model.startswith(p) for p in self.TOOL_CAPABLE_PREFIXES)
+
+    def chat(self, model, messages, tools=None, stream=True):
+        model = model or self.default_model
+
+        if tools and not self._model_supports_tools(model):
+            # Non-tool model: inject tools as XML prompt, parse from text
+            messages = self._inject_tools_as_prompt(messages, tools)
+            return super().chat(model, messages, tools=None, stream=stream)
+
+        return super().chat(model, messages, tools, stream)
+
+    def _inject_tools_as_prompt(self, messages, tools):
+        """Inject tool definitions into system prompt as XML."""
+        tool_desc = self._format_tools_as_xml(tools)
+
+        messages = list(messages)  # copy
+        system_idx = next(
+            (i for i, m in enumerate(messages) if m["role"] == "system"), None
+        )
+        tool_instruction = (
+            f"\n\n## Available Tools\n{tool_desc}\n\n"
+            "When you need to use a tool, output it in this exact XML format:\n"
+            '<function=TOOL_NAME>{"param": "value"}</function>\n'
+            "Wait for the result before continuing."
+        )
+        if system_idx is not None:
+            messages[system_idx] = {
+                **messages[system_idx],
+                "content": messages[system_idx]["content"] + tool_instruction
+            }
+        else:
+            messages.insert(0, {"role": "system", "content": tool_instruction})
+
+        return messages
+
+    @staticmethod
+    def _format_tools_as_xml(tools):
+        """Convert tool schema to XML description text."""
+        lines = []
+        for t in tools:
+            fn = t.get("function", t)  # handle both wrapped and unwrapped
+            params = fn.get("parameters", {}).get("properties", {})
+            required = fn.get("parameters", {}).get("required", [])
+            param_desc = ", ".join(
+                f'{k}: {v.get("type", "any")}{"(required)" if k in required else ""}'
+                for k, v in params.items()
+            )
+            lines.append(f"- {fn['name']}({param_desc}): {fn.get('description', '')}")
+        return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# VertexAI MAAS Provider (ADC auth — same as Claude Code)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class VertexAIClient(OpenAICompatClient):
+    """VertexAI Model-as-a-Service with ADC authentication.
+
+    Auth flow (same as Claude Code VertexAI integration):
+    1. Read ADC file (~/.config/gcloud/application_default_credentials.json)
+    2. POST refresh_token + client_id/secret to Google OAuth2 endpoint
+    3. Cache access_token (55 min TTL, auto-refresh)
+
+    Dependencies: urllib only (no google-auth library needed)
+    """
+
+    ADC_PATHS = [
+        os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
+        os.path.join(os.environ.get("APPDATA", ""), "gcloud",
+                     "application_default_credentials.json"),
+    ]
+    TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+    def __init__(self, project_id, location, model, **kwargs):
+        base_url = (
+            f"https://{location}-aiplatform.googleapis.com/v1"
+            f"/projects/{project_id}/locations/{location}"
+            f"/endpoints/openapi"
+        )
+        super().__init__(
+            base_url=base_url,
+            api_key=None,
+            default_model=model,
+            **kwargs
+        )
+        self.project_id = project_id
+        self.location = location
+        self._token_cache = None
+        self._token_expiry = 0
+        self._adc_creds = None
+
+    def _build_headers(self):
+        """Build headers with OAuth2 token from ADC."""
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        token = self._get_access_token()
+        headers["Authorization"] = f"Bearer {token}"
+        headers.update(self.extra_headers)
+        return headers
+
+    def _load_adc_credentials(self):
+        """Load ADC file. Same search order as Claude Code."""
+        if self._adc_creds:
+            return self._adc_creds
+
+        # Priority 1: GOOGLE_APPLICATION_CREDENTIALS env var
+        sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if sa_path and os.path.exists(sa_path):
+            with open(sa_path) as f:
+                self._adc_creds = json.load(f)
+                return self._adc_creds
+
+        # Priority 2: Default ADC file (gcloud auth application-default login)
+        for path in self.ADC_PATHS:
+            if os.path.exists(path):
+                with open(path) as f:
+                    self._adc_creds = json.load(f)
+                    return self._adc_creds
+
+        raise RuntimeError(
+            "GCP credentials not found. Run:\n"
+            "  gcloud auth application-default login\n\n"
+            "See: https://cloud.google.com/docs/authentication/application-default-credentials"
+        )
+
+    def _get_access_token(self):
+        """Get access_token from ADC refresh_token. Auto-cache & refresh."""
+        now = time.time()
+        if self._token_cache and now < self._token_expiry:
+            return self._token_cache
+
+        creds = self._load_adc_credentials()
+        cred_type = creds.get("type", "")
+
+        if cred_type == "authorized_user":
+            data = urllib.parse.urlencode({
+                "client_id": creds["client_id"],
+                "client_secret": creds["client_secret"],
+                "refresh_token": creds["refresh_token"],
+                "grant_type": "refresh_token",
+            }).encode()
+
+            req = urllib.request.Request(
+                self.TOKEN_ENDPOINT, data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            try:
+                token_data = json.loads(resp.read().decode())
+            finally:
+                resp.close()
+
+            self._token_cache = token_data["access_token"]
+            self._token_expiry = now + token_data.get("expires_in", 3600) - 300
+            return self._token_cache
+
+        elif cred_type == "service_account":
+            try:
+                result = subprocess.run(
+                    ["gcloud", "auth", "print-access-token"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    self._token_cache = result.stdout.strip()
+                    self._token_expiry = now + 55 * 60
+                    return self._token_cache
+                else:
+                    stderr_msg = result.stderr.strip()[:200] if result.stderr else "unknown error"
+                    raise RuntimeError(
+                        f"gcloud auth failed (exit {result.returncode}): {stderr_msg}\n"
+                        "Try: gcloud auth application-default login"
+                    )
+            except FileNotFoundError:
+                raise RuntimeError(
+                    "Service account auth requires gcloud CLI (not found in PATH).\n"
+                    "Alternative: gcloud auth application-default login"
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "gcloud auth print-access-token timed out (10s).\n"
+                    "Check your network and gcloud configuration."
+                )
+
+        else:
+            raise RuntimeError(f"Unknown ADC credential type: {cred_type}")
+
+    def check_connection(self, retries=3):
+        """Check VertexAI connection by acquiring a token."""
+        try:
+            self._get_access_token()
+            return True, [self.default_model]
+        except Exception as e:
+            return False, [str(e)]
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Provider Factory
+# ════════════════════════════════════════════════════════════════════════════════
+
+def create_client(config) -> LLMClient:
+    """Create LLM client based on config.provider."""
+    provider = getattr(config, "provider", "ollama")
+    common = dict(
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        context_window=config.context_window,
+        timeout=getattr(config, "timeout", 300),
+        debug=config.debug,
+    )
+
+    if provider == "ollama":
+        return OllamaClient(config)
+
+    elif provider == "openrouter":
+        if not config.api_key:
+            raise ValueError(
+                "OpenRouter requires an API key. "
+                "Set OPENROUTER_API_KEY or use --api-key"
+            )
+        return OpenRouterClient(
+            api_key=config.api_key,
+            model=config.model,
+            **common
+        )
+
+    elif provider == "vertexai":
+        if not config.vertexai_project:
+            raise ValueError(
+                "VertexAI requires a project ID. "
+                "Set GOOGLE_CLOUD_PROJECT or use --vertexai-project"
+            )
+        return VertexAIClient(
+            project_id=config.vertexai_project,
+            location=config.vertexai_location,
+            model=config.model,
+            **common
+        )
+
+    elif provider == "openai-compat":
+        if not config.base_url:
+            raise ValueError(
+                "openai-compat requires a base URL. Use --base-url"
+            )
+        return OpenAICompatClient(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            default_model=config.model,
+            **common
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown provider: {provider}. "
+            f"Available: ollama, openrouter, vertexai, openai-compat"
+        )
+
+
+class OllamaClient(LLMClient):
     """Communicates with Ollama via /v1/chat/completions."""
 
     def __init__(self, config):
@@ -7356,82 +7929,101 @@ def main():
     if not config.prompt:
         tui.banner(config, model_ok=True)  # skip banner in one-shot mode (-p)
 
-    # Check Ollama connection
-    client = OllamaClient(config)
+    # Create LLM client via provider factory
+    try:
+        client = create_client(config)
+    except ValueError as e:
+        print(f"\n{C.RED}{e}{C.RESET}")
+        sys.exit(1)
+
     ok, models = client.check_connection()
-    if not ok:
-        print(f"\n{C.RED}Ollama (the local AI engine) is not running.{C.RESET}")
-        if platform.system() == "Darwin":
-            print(f"{C.DIM}Look for the llama icon in your menu bar, or open the Ollama app.{C.RESET}")
-        else:
-            print(f"{C.DIM}Start it by running this in another terminal:  ollama serve{C.RESET}")
-        # Try to auto-start Ollama on macOS and Linux
-        if shutil.which("ollama"):
-            try:
-                ans = "y" if config.yes_mode else input(
-                    f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}"
-                ).strip().lower()
-                if ans in ("", "y", "yes"):
-                    if platform.system() == "Darwin":
-                        # Try macOS app first, fall back to CLI
-                        try:
-                            subprocess.Popen(
-                                ["open", "-a", "Ollama"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            )
-                        except Exception:
+
+    if config.provider == "ollama":
+        # Ollama-specific: auto-start, model pull, etc.
+        if not ok:
+            print(f"\n{C.RED}Ollama (the local AI engine) is not running.{C.RESET}")
+            if platform.system() == "Darwin":
+                print(f"{C.DIM}Look for the llama icon in your menu bar, or open the Ollama app.{C.RESET}")
+            else:
+                print(f"{C.DIM}Start it by running this in another terminal:  ollama serve{C.RESET}")
+            # Try to auto-start Ollama on macOS and Linux
+            if shutil.which("ollama"):
+                try:
+                    ans = "y" if config.yes_mode else input(
+                        f"{_ansi(chr(27)+'[38;5;51m')}Try to start Ollama automatically? [Y/n]: {C.RESET}"
+                    ).strip().lower()
+                    if ans in ("", "y", "yes"):
+                        if platform.system() == "Darwin":
+                            try:
+                                subprocess.Popen(
+                                    ["open", "-a", "Ollama"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                )
+                            except Exception:
+                                subprocess.Popen(
+                                    ["ollama", "serve"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True,
+                                )
+                        else:
                             subprocess.Popen(
                                 ["ollama", "serve"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True,
                             )
-                    else:
-                        subprocess.Popen(
-                            ["ollama", "serve"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            start_new_session=True,
-                        )
-                    print(f"{_ansi(chr(27)+'[38;5;51m')}Starting Ollama... waiting up to 10s{C.RESET}")
-                    for _wait in range(10):
-                        time.sleep(1)
-                        ok, models = client.check_connection()
-                        if ok:
-                            print(f"{C.GREEN}Ollama started successfully!{C.RESET}")
-                            break
-            except (EOFError, KeyboardInterrupt):
-                print()
-            except Exception:
-                pass
-        if not ok:
-            sys.exit(1)
-
-    model_ok = client.check_model(config.model, available_models=models)
-
-    if not model_ok:
-        print(f"\n{C.YELLOW}The AI model '{config.model}' hasn't been downloaded yet.{C.RESET}")
-        if models:
-            print(f"{C.DIM}Models already downloaded: {', '.join(models)}{C.RESET}")
-        else:
-            print(f"{C.DIM}No models downloaded yet.{C.RESET}")
-        do_pull = False
-        if config.yes_mode:
-            do_pull = True
-        else:
-            try:
-                ans = input(f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}").strip().lower()
-                do_pull = ans in ("", "y", "yes")
-            except (EOFError, KeyboardInterrupt):
-                print()
-        if do_pull:
-            print(f"{C.CYAN}Downloading {config.model}... (this may take a few minutes){C.RESET}")
-            if client.pull_model(config.model):
-                print(f"{C.GREEN}Download complete: {config.model}{C.RESET}")
-                model_ok = True
-            else:
-                print(f"{C.RED}Download failed. Try manually:  ollama pull {config.model}{C.RESET}")
+                        print(f"{_ansi(chr(27)+'[38;5;51m')}Starting Ollama... waiting up to 10s{C.RESET}")
+                        for _wait in range(10):
+                            time.sleep(1)
+                            ok, models = client.check_connection()
+                            if ok:
+                                print(f"{C.GREEN}Ollama started successfully!{C.RESET}")
+                                break
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                except Exception:
+                    pass
+            if not ok:
                 sys.exit(1)
-        else:
-            print(f"{C.DIM}Skipping download. The AI may not work until the model is downloaded.{C.RESET}")
+
+        model_ok = client.check_model(config.model, available_models=models)
+
+        if not model_ok:
+            print(f"\n{C.YELLOW}The AI model '{config.model}' hasn't been downloaded yet.{C.RESET}")
+            if models:
+                print(f"{C.DIM}Models already downloaded: {', '.join(models)}{C.RESET}")
+            else:
+                print(f"{C.DIM}No models downloaded yet.{C.RESET}")
+            do_pull = False
+            if config.yes_mode:
+                do_pull = True
+            else:
+                try:
+                    ans = input(f"{C.CYAN}Download '{config.model}' now? (may be several GB) [Y/n]: {C.RESET}").strip().lower()
+                    do_pull = ans in ("", "y", "yes")
+                except (EOFError, KeyboardInterrupt):
+                    print()
+            if do_pull:
+                print(f"{C.CYAN}Downloading {config.model}... (this may take a few minutes){C.RESET}")
+                if client.pull_model(config.model):
+                    print(f"{C.GREEN}Download complete: {config.model}{C.RESET}")
+                    model_ok = True
+                else:
+                    print(f"{C.RED}Download failed. Try manually:  ollama pull {config.model}{C.RESET}")
+                    sys.exit(1)
+            else:
+                print(f"{C.DIM}Skipping download. The AI may not work until the model is downloaded.{C.RESET}")
+
+    else:
+        # Cloud providers: simple connection check
+        if not ok:
+            print(f"\n{C.RED}Cannot connect to {config.provider} provider.{C.RESET}")
+            if models and models[0]:
+                print(f"{C.DIM}Error: {models[0]}{C.RESET}")
+            sys.exit(1)
+        model_ok = True
+        if config.debug:
+            print(f"{C.DIM}[debug] Provider={config.provider} model={config.model} "
+                  f"connected OK{C.RESET}", file=sys.stderr)
 
     # Setup components
     system_prompt = _build_system_prompt(config)
