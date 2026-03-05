@@ -758,9 +758,9 @@ class Config:
         elif not self.model:
             # Cloud providers require explicit model name
             if self.provider == "openrouter":
-                self.model = "qwen/qwen-2.5-coder-32b-instruct"
+                self.model = "qwen/qwen3-coder"
             elif self.provider == "vertexai":
-                self.model = "qwen/qwen3-coder-480b-a35b-instruct-maas"
+                self.model = "qwen3-coder-480b-a35b-instruct-maas"
         self._ensure_dirs()
         return self
 
@@ -1696,6 +1696,10 @@ class OpenRouterClient(OpenAICompatClient):
     For models without native tool calling support (e.g. qwen-2.5-coder-32b),
     injects tool definitions as XML into the system prompt and relies on
     _extract_tool_calls_from_text() for parsing.
+
+    Supports short aliases for convenience:
+        --model qwen3       → qwen/qwen3-coder
+        --model qwen2.5     → qwen/qwen-2.5-coder-32b-instruct
     """
 
     TOOL_CAPABLE_PREFIXES = {
@@ -1703,7 +1707,15 @@ class OpenRouterClient(OpenAICompatClient):
         "google/gemini-", "meta-llama/llama-3.3-",
     }
 
+    MODEL_ALIASES = {
+        "qwen3": "qwen/qwen3-coder",
+        "qwen3-coder": "qwen/qwen3-coder",
+        "qwen2.5": "qwen/qwen-2.5-coder-32b-instruct",
+        "qwen2.5-coder": "qwen/qwen-2.5-coder-32b-instruct",
+    }
+
     def __init__(self, api_key, model, **kwargs):
+        model = self.MODEL_ALIASES.get(model, model)
         super().__init__(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
@@ -1720,7 +1732,7 @@ class OpenRouterClient(OpenAICompatClient):
         return any(model.startswith(p) for p in self.TOOL_CAPABLE_PREFIXES)
 
     def chat(self, model, messages, tools=None, stream=True):
-        model = model or self.default_model
+        model = self.MODEL_ALIASES.get(model, model) if model else self.default_model
 
         if tools and not self._model_supports_tools(model):
             # Non-tool model: inject tools as XML prompt, parse from text
@@ -1791,7 +1803,14 @@ class VertexAIClient(OpenAICompatClient):
     ]
     TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
+    MODEL_ALIASES = {
+        "qwen3-coder": "qwen3-coder-480b-a35b-instruct-maas",
+        "qwen3": "qwen3-235b-a22b-instruct-2507-maas",
+        "qwen3-235b": "qwen3-235b-a22b-instruct-2507-maas",
+    }
+
     def __init__(self, project_id, location, model, **kwargs):
+        model = self.MODEL_ALIASES.get(model, model)
         base_url = (
             f"https://{location}-aiplatform.googleapis.com/v1"
             f"/projects/{project_id}/locations/{location}"
@@ -1816,6 +1835,10 @@ class VertexAIClient(OpenAICompatClient):
         headers["Authorization"] = f"Bearer {token}"
         headers.update(self.extra_headers)
         return headers
+
+    def chat(self, model, messages, tools=None, stream=True):
+        model = self.MODEL_ALIASES.get(model, model) if model else self.default_model
+        return super().chat(model, messages, tools, stream)
 
     def _load_adc_credentials(self):
         """Load ADC file. Same search order as Claude Code."""
