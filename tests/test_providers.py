@@ -589,24 +589,24 @@ class TestVertexAIClient:
 
     def test_alias_qwen3_coder_resolves(self):
         client = self._make_client(model="qwen3-coder")
-        assert client.default_model == "qwen3-coder-480b-a35b-instruct-maas"
+        assert client.default_model == "qwen/qwen3-coder-480b-a35b-instruct-maas"
 
     def test_alias_qwen3_resolves_to_lightweight(self):
         """Short alias 'qwen3' should resolve to the lightweight 235b model."""
         client = self._make_client(model="qwen3")
-        assert client.default_model == "qwen3-235b-a22b-instruct-2507-maas"
+        assert client.default_model == "qwen/qwen3-235b-a22b-instruct-2507-maas"
 
     def test_alias_qwen3_235b_resolves(self):
         client = self._make_client(model="qwen3-235b")
-        assert client.default_model == "qwen3-235b-a22b-instruct-2507-maas"
+        assert client.default_model == "qwen/qwen3-235b-a22b-instruct-2507-maas"
 
     def test_full_model_id_passes_through(self):
-        client = self._make_client(model="qwen3-coder-480b-a35b-instruct-maas")
-        assert client.default_model == "qwen3-coder-480b-a35b-instruct-maas"
+        client = self._make_client(model="qwen/qwen3-coder-480b-a35b-instruct-maas")
+        assert client.default_model == "qwen/qwen3-coder-480b-a35b-instruct-maas"
 
     def test_alias_resolved_in_chat(self):
         """Aliases passed to chat() should be resolved."""
-        client = self._make_client(model="qwen3-coder-480b-a35b-instruct-maas")
+        client = self._make_client(model="qwen/qwen3-coder-480b-a35b-instruct-maas")
         client._token_cache = "test-token"
         client._token_expiry = time.time() + 3600
         with patch.object(
@@ -618,7 +618,7 @@ class TestVertexAIClient:
             ))
             mock_chat.assert_called_once()
             call_model = mock_chat.call_args[1].get("model") or mock_chat.call_args[0][0]
-            assert call_model == "qwen3-235b-a22b-instruct-2507-maas"
+            assert call_model == "qwen/qwen3-235b-a22b-instruct-2507-maas"
 
     # --- ADC file loading ---
 
