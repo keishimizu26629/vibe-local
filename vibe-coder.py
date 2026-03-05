@@ -744,6 +744,7 @@ class Config:
 
         self.config_file = os.path.join(self.config_dir, "config")
         self.permissions_file = os.path.join(self.config_dir, "permissions.json")
+        self.hooks_file = os.path.join(self.config_dir, "hooks.json")
         self.sessions_dir = os.path.join(self.state_dir, "sessions")
         self.history_file = os.path.join(self.state_dir, "history")
 
@@ -5557,6 +5558,81 @@ class ToolRegistry:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Hook Runner
+# ════════════════════════════════════════════════════════════════════════════════
+
+class HookRunner:
+    """Runs pre-tool-use hooks from ~/.config/vibe-local/hooks.json.
+
+    Compatible with Claude Code hooks format:
+      {
+        "hooks": {
+          "PreToolUse": [
+            { "matcher": "Bash",
+              "hooks": [{ "type": "command", "command": "path/to/script.sh" }] }
+          ]
+        }
+      }
+
+    Scripts receive JSON on stdin: {"tool_name": "Bash", "tool_input": {"command": "..."}}
+    Exit codes: 0 = allow, 2 = block (stderr shown as reason).
+    """
+
+    def __init__(self, hooks_file):
+        self._pre_tool_use = []  # list of (matcher, command)
+        self._load(hooks_file)
+
+    def _load(self, path):
+        if not path or not os.path.isfile(path):
+            return
+        if os.path.islink(path):
+            return  # skip symlinks for security
+        try:
+            if os.path.getsize(path) > 65536:
+                return
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            hooks_cfg = data.get("hooks", {})
+            for entry in hooks_cfg.get("PreToolUse", []):
+                matcher = entry.get("matcher", "")
+                for h in entry.get("hooks", []):
+                    if h.get("type") == "command" and h.get("command"):
+                        self._pre_tool_use.append((matcher, h["command"]))
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            print(f"Warning: Could not load hooks: {e}", file=sys.stderr)
+
+    def run_pre_tool_use(self, tool_name, params):
+        """Run pre-tool-use hooks. Returns (allowed: bool, reason: str|None)."""
+        for matcher, command in self._pre_tool_use:
+            if matcher and matcher != tool_name:
+                continue  # matcher doesn't match this tool
+            payload = json.dumps({"tool_name": tool_name, "tool_input": params})
+            cmd_expanded = os.path.expanduser(command)
+            try:
+                proc = subprocess.run(
+                    cmd_expanded,
+                    shell=True,
+                    input=payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if proc.returncode == 2:
+                    reason = (proc.stderr or "").strip() or "Blocked by hook"
+                    return False, reason
+                # Any other exit code (including non-zero) is treated as allow
+            except FileNotFoundError:
+                continue  # script not found — fail open
+            except subprocess.TimeoutExpired:
+                continue  # timeout — fail open
+            except OSError:
+                continue  # permission error etc — fail open
+        return True, None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Permission Manager
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5573,6 +5649,7 @@ class PermissionMgr:
         self.rules = {}  # tool_name -> "allow" | "deny" | pattern list
         self._session_allows = set()  # remembered "allow" decisions this session
         self._session_denies = set()  # remembered "deny" decisions this session
+        self._hook_runner = HookRunner(config.hooks_file)
         self._load_rules(config.permissions_file)
 
     # Dangerous commands that require confirmation even in -y mode
@@ -5609,6 +5686,13 @@ class PermissionMgr:
         """Check if tool execution is allowed. Returns True to proceed."""
         # Session-level deny takes priority
         if tool_name in self._session_denies:
+            return False
+
+        # Run pre-tool-use hooks (external scripts)
+        allowed, reason = self._hook_runner.run_pre_tool_use(tool_name, params)
+        if not allowed:
+            if tui:
+                tui.show_tool_result(tool_name, f"Blocked by hook: {reason}", True)
             return False
 
         # Even in -y mode, confirm truly dangerous Bash commands
