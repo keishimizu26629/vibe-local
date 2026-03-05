@@ -760,7 +760,7 @@ class Config:
             if self.provider == "openrouter":
                 self.model = "qwen/qwen3-coder"
             elif self.provider == "vertexai":
-                self.model = "qwen/qwen3-coder-480b-a35b-instruct-maas"
+                self.model = "qwen3-coder-480b-a35b-instruct-maas"
         self._ensure_dirs()
         return self
 
@@ -1803,7 +1803,14 @@ class VertexAIClient(OpenAICompatClient):
     ]
     TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
+    MODEL_ALIASES = {
+        "qwen3-coder": "qwen3-coder-480b-a35b-instruct-maas",
+        "qwen3": "qwen3-235b-a22b-instruct-2507-maas",
+        "qwen3-235b": "qwen3-235b-a22b-instruct-2507-maas",
+    }
+
     def __init__(self, project_id, location, model, **kwargs):
+        model = self.MODEL_ALIASES.get(model, model)
         base_url = (
             f"https://{location}-aiplatform.googleapis.com/v1"
             f"/projects/{project_id}/locations/{location}"
@@ -1828,6 +1835,10 @@ class VertexAIClient(OpenAICompatClient):
         headers["Authorization"] = f"Bearer {token}"
         headers.update(self.extra_headers)
         return headers
+
+    def chat(self, model, messages, tools=None, stream=True):
+        model = self.MODEL_ALIASES.get(model, model) if model else self.default_model
+        return super().chat(model, messages, tools, stream)
 
     def _load_adc_credentials(self):
         """Load ADC file. Same search order as Claude Code."""
