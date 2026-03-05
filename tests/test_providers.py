@@ -1059,3 +1059,351 @@ class TestHookRunner:
         runner = vc.HookRunner(str(hooks_file))
         allowed, _ = runner.run_pre_tool_use("Write", {"file_path": "/etc/passwd"})
         assert allowed is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: Symlink Parent Directory Validation (H-S02)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSymlinkParentDir:
+    """Test _resolve_safe_write_path detects symlinks in parent directories."""
+
+    def test_normal_path_allowed(self, tmp_path):
+        """Normal (non-symlink) path should be allowed."""
+        f = tmp_path / "test.txt"
+        f.write_text("hello")
+        resolved, err = vc._resolve_safe_write_path(str(f))
+        assert err is None
+        assert resolved is not None
+
+    def test_file_symlink_rejected(self, tmp_path):
+        """Direct file symlink should be rejected."""
+        real = tmp_path / "real.txt"
+        real.write_text("hello")
+        link = tmp_path / "link.txt"
+        link.symlink_to(real)
+        resolved, err = vc._resolve_safe_write_path(str(link))
+        assert resolved is None
+        assert "symlink" in err
+
+    def test_parent_dir_symlink_rejected(self, tmp_path):
+        """Symlinked parent directory should be rejected."""
+        real_dir = tmp_path / "real_dir"
+        real_dir.mkdir()
+        (real_dir / "file.txt").write_text("hello")
+        link_dir = tmp_path / "link_dir"
+        link_dir.symlink_to(real_dir)
+        resolved, err = vc._resolve_safe_write_path(str(link_dir / "file.txt"))
+        assert resolved is None
+        assert "symlinked directory" in err
+
+    def test_new_file_in_normal_dir_allowed(self, tmp_path):
+        """New file in a normal (non-symlink) directory should be allowed."""
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        resolved, err = vc._resolve_safe_write_path(str(subdir / "new.txt"))
+        assert err is None
+        assert resolved is not None
+
+    def test_nonexistent_path_allowed(self, tmp_path):
+        """Non-existent path with valid parent should be allowed."""
+        resolved, err = vc._resolve_safe_write_path(str(tmp_path / "nonexistent.txt"))
+        assert err is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: Session ID Strength (M-S07)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionIDStrength:
+    """Test that session IDs have sufficient entropy."""
+
+    def test_session_id_has_sufficient_length(self):
+        """Auto-generated session ID should have >20 chars of randomness."""
+        cfg = mock.MagicMock()
+        cfg.session_id = None
+        cfg.sessions_dir = tempfile.mkdtemp()
+        cfg.history_file = os.path.join(cfg.sessions_dir, "history")
+        session = vc.Session(cfg, "test prompt")
+        # Format: YYYYMMDD_HHMMSS_<random>
+        parts = session.session_id.split("_", 2)
+        assert len(parts) >= 3, f"Expected at least 3 parts, got: {session.session_id}"
+        random_part = parts[2] if len(parts) > 2 else ""
+        assert len(random_part) >= 20, (
+            f"Random part too short ({len(random_part)} chars): {session.session_id}"
+        )
+
+    def test_session_id_uniqueness(self):
+        """Two session IDs should be different."""
+        cfg = mock.MagicMock()
+        cfg.session_id = None
+        cfg.sessions_dir = tempfile.mkdtemp()
+        cfg.history_file = os.path.join(cfg.sessions_dir, "history")
+        s1 = vc.Session(cfg, "test")
+        s2 = vc.Session(cfg, "test")
+        assert s1.session_id != s2.session_id
+
+    def test_custom_session_id_preserved(self):
+        """User-provided session ID should be used as-is."""
+        cfg = mock.MagicMock()
+        cfg.session_id = "my-custom-id"
+        cfg.sessions_dir = tempfile.mkdtemp()
+        cfg.history_file = os.path.join(cfg.sessions_dir, "history")
+        session = vc.Session(cfg, "test")
+        assert session.session_id == "my-custom-id"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: TeamManager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTeamManager:
+    """Test TeamManager CRUD operations and file persistence."""
+
+    def test_create_team(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        config = tm.create_team("test-team", "Test description")
+        assert config["team_name"] == "test-team"
+        assert config["description"] == "Test description"
+        assert config["members"] == []
+        # Verify file was created
+        assert os.path.exists(tm._config_path("test-team"))
+        assert os.path.exists(tm._tasks_path("test-team"))
+
+    def test_create_duplicate_team_raises(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("test-team")
+        with pytest.raises(ValueError, match="already exists"):
+            tm.create_team("test-team")
+
+    def test_get_team(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("my-team", "desc")
+        team = tm.get_team("my-team")
+        assert team is not None
+        assert team["team_name"] == "my-team"
+
+    def test_get_nonexistent_team(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        assert tm.get_team("nope") is None
+
+    def test_list_teams(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        assert tm.list_teams() == []
+        tm.create_team("alpha")
+        tm.create_team("beta")
+        teams = sorted(tm.list_teams())
+        assert teams == ["alpha", "beta"]
+
+    def test_add_and_remove_member(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("team")
+        tm.add_member("team", "coder", "agent-1", "full")
+        team = tm.get_team("team")
+        assert len(team["members"]) == 1
+        assert team["members"][0]["name"] == "coder"
+        tm.remove_member("team", "coder")
+        team = tm.get_team("team")
+        assert len(team["members"]) == 0
+
+    def test_add_duplicate_member_raises(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("team")
+        tm.add_member("team", "coder", "agent-1", "full")
+        with pytest.raises(ValueError, match="already exists"):
+            tm.add_member("team", "coder", "agent-2", "read-only")
+
+    def test_delete_team(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("doomed")
+        tm.delete_team("doomed")
+        assert tm.get_team("doomed") is None
+
+    def test_task_persistence(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("team")
+        tasks = tm.load_tasks("team")
+        assert tasks == {"next_id": 1, "tasks": {}}
+        tasks["tasks"]["1"] = {"id": "1", "subject": "Test", "status": "pending"}
+        tasks["next_id"] = 2
+        tm.save_tasks("team", tasks)
+        loaded = tm.load_tasks("team")
+        assert loaded["tasks"]["1"]["subject"] == "Test"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: MessageBus
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMessageBus:
+    """Test MessageBus DM, broadcast, and shutdown protocol."""
+
+    def test_send_and_receive_dm(self):
+        bus = vc.MessageBus()
+        bus.register("alice")
+        bus.register("bob")
+        bus.send("alice", "bob", "Hello Bob")
+        msg = bus.receive("bob", block=False)
+        assert msg is not None
+        assert msg.sender == "alice"
+        assert msg.content == "Hello Bob"
+        assert msg.msg_type == "message"
+
+    def test_receive_empty_returns_none(self):
+        bus = vc.MessageBus()
+        bus.register("alice")
+        msg = bus.receive("alice", block=False)
+        assert msg is None
+
+    def test_broadcast(self):
+        bus = vc.MessageBus()
+        bus.register("lead")
+        bus.register("worker1")
+        bus.register("worker2")
+        bus.broadcast("lead", "All hands meeting")
+        m1 = bus.receive("worker1", block=False)
+        m2 = bus.receive("worker2", block=False)
+        assert m1 is not None and m1.content == "All hands meeting"
+        assert m2 is not None and m2.content == "All hands meeting"
+        # Sender should NOT receive their own broadcast
+        assert bus.receive("lead", block=False) is None
+
+    def test_shutdown_protocol(self):
+        bus = vc.MessageBus()
+        bus.register("lead")
+        bus.register("worker")
+        req_id = bus.shutdown_request("lead", "worker")
+        msg = bus.receive("worker", block=False)
+        assert msg is not None
+        assert msg.msg_type == "shutdown_request"
+        assert msg.request_id == req_id
+        bus.shutdown_response("worker", req_id, True, "OK")
+        resp = bus.receive("lead", block=False)
+        assert resp is not None
+        assert resp.msg_type == "shutdown_response"
+        assert "approved" in resp.content
+
+    def test_send_to_unknown_recipient_raises(self):
+        bus = vc.MessageBus()
+        bus.register("alice")
+        with pytest.raises(ValueError, match="Unknown recipient"):
+            bus.send("alice", "nobody", "Hello?")
+
+    def test_pending_count(self):
+        bus = vc.MessageBus()
+        bus.register("alice")
+        assert bus.pending_count("alice") == 0
+        bus.send("system", "alice", "msg1")
+        bus.send("system", "alice", "msg2")
+        assert bus.pending_count("alice") == 2
+
+    def test_unregister(self):
+        bus = vc.MessageBus()
+        bus.register("alice")
+        bus.unregister("alice")
+        assert bus.pending_count("alice") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: Team Tools
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTeamTools:
+    """Test TeamCreateTool, TeamDeleteTool, SendMessageTool."""
+
+    def test_team_create_tool(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tool = vc.TeamCreateTool(tm)
+        result = tool.execute({"team_name": "my-team", "description": "Test"})
+        assert "Created team" in result
+        assert tm.get_team("my-team") is not None
+
+    def test_team_create_invalid_name(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tool = vc.TeamCreateTool(tm)
+        result = tool.execute({"team_name": "../evil"})
+        assert "Error" in result
+
+    def test_team_delete_tool(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("temp")
+        tool = vc.TeamDeleteTool(tm)
+        result = tool.execute({"team_name": "temp"})
+        assert "Deleted" in result
+
+    def test_team_delete_with_members_blocked(self, tmp_path):
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("busy")
+        tm.add_member("busy", "worker", "id-1", "full")
+        tool = vc.TeamDeleteTool(tm)
+        result = tool.execute({"team_name": "busy"})
+        assert "still has" in result
+
+    def test_send_message_tool_dm(self):
+        bus = vc.MessageBus()
+        bus.register("main")
+        bus.register("worker")
+        tool = vc.SendMessageTool(bus, sender_name="main")
+        result = tool.execute({"type": "message", "recipient": "worker", "content": "Do task"})
+        assert "Message sent" in result
+        msg = bus.receive("worker", block=False)
+        assert msg.content == "Do task"
+
+    def test_send_message_tool_broadcast(self):
+        bus = vc.MessageBus()
+        bus.register("main")
+        bus.register("w1")
+        bus.register("w2")
+        tool = vc.SendMessageTool(bus, sender_name="main")
+        result = tool.execute({"type": "broadcast", "content": "Attention"})
+        assert "Broadcast sent" in result
+
+    def test_send_message_tool_shutdown(self):
+        bus = vc.MessageBus()
+        bus.register("main")
+        bus.register("worker")
+        tool = vc.SendMessageTool(bus, sender_name="main")
+        result = tool.execute({"type": "shutdown_request", "recipient": "worker"})
+        assert "Shutdown request sent" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tests: Task Store Persistence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTaskStorePersistence:
+    """Test that task tools use _get_task_store / _save_task_store correctly."""
+
+    def test_task_create_in_memory(self):
+        """TaskCreateTool works with default in-memory store."""
+        # Reset store
+        vc._task_store = {"next_id": 1, "tasks": {}}
+        vc._active_team_name = None
+        vc._active_team_manager = None
+        tool = vc.TaskCreateTool()
+        result = tool.execute({"subject": "Test", "description": "Desc"})
+        assert "Created task #1" in result
+
+    def test_task_create_with_team(self, tmp_path):
+        """TaskCreateTool persists to team file when team is active."""
+        tm = vc.TeamManager(str(tmp_path))
+        tm.create_team("test-team")
+        # Activate team context
+        vc._active_team_name = "test-team"
+        vc._active_team_manager = tm
+        try:
+            tool = vc.TaskCreateTool()
+            tool.execute({"subject": "Team Task", "description": "Desc"})
+            # Verify persisted to file
+            tasks = tm.load_tasks("test-team")
+            assert "1" in tasks["tasks"]
+            assert tasks["tasks"]["1"]["subject"] == "Team Task"
+        finally:
+            vc._active_team_name = None
+            vc._active_team_manager = None

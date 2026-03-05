@@ -40,6 +40,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 import collections
 import concurrent.futures
+import secrets
+import queue
 
 # readline is not available on Windows
 try:
@@ -88,12 +90,12 @@ def _cleanup_scroll_region():
     if sr is not None and sr._active:
         try:
             sr.teardown()
-        except Exception:
+        except OSError:
             # Last resort: raw reset
             try:
                 sys.stdout.write("\033[1;999r\033[?25h")
                 sys.stdout.flush()
-            except Exception:
+            except OSError:
                 pass
 
 atexit.register(_cleanup_scroll_region)
@@ -582,7 +584,7 @@ class InputMonitor:
             self._typeahead.clear()
         try:
             return raw.decode("utf-8", errors="replace")
-        except Exception:
+        except UnicodeDecodeError:
             return ""
 
     def start(self):
@@ -665,11 +667,11 @@ class InputMonitor:
             else:
                 try:
                     text = b"".join(self._typeahead).decode("utf-8", errors="replace")
-                except Exception:
+                except UnicodeDecodeError:
                     text = ""
         try:
             self._on_typeahead(text)
-        except Exception:
+        except (TypeError, ValueError, OSError):
             pass
 
     def stop(self):
@@ -1085,7 +1087,7 @@ class Config:
             finally:
                 resp.close()
             return [m["name"].strip() for m in data.get("models", [])]
-        except Exception:
+        except (urllib.error.URLError, json.JSONDecodeError, OSError, KeyError):
             return []
 
     def _pick_best_model(self, installed, ram_gb):
@@ -1240,7 +1242,7 @@ def _get_ram_gb():
             stat.dwLength = ctypes.sizeof(stat)
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
             return stat.ullTotalPhys // (1024 ** 3)
-    except Exception:
+    except (OSError, ValueError):
         pass
     return 16  # fallback assumption
 
@@ -1271,7 +1273,7 @@ def _get_vram_gb():
                 return max(vram_values) // 1024  # MiB → GiB
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         pass  # nvidia-smi not available
-    except Exception:
+    except (OSError, ValueError):
         pass
     return 0
 
@@ -1419,7 +1421,7 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
             content, truncated = _load_instructions(global_md)
             trunc_note = "\n[Note: file truncated, only first 4000 bytes loaded]" if truncated else ""
             prompt += f"\n# Global Instructions\n{_sanitize_instructions(content)}{trunc_note}\n"
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             pass
 
     # 2. Parent directory hierarchy → cwd (walk up from cwd to find CLAUDE.md in parent dirs)
@@ -1563,7 +1565,7 @@ class OpenAICompatClient(LLMClient):
             status_code = e.code
             try:
                 error_body = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
+            except (IOError, AttributeError):
                 pass
             finally:
                 e.close()
@@ -1627,7 +1629,7 @@ class OpenAICompatClient(LLMClient):
         finally:
             try:
                 resp.close()
-            except Exception:
+            except OSError:
                 pass
 
     def chat_sync(self, model, messages, tools=None):
@@ -1676,7 +1678,7 @@ class OpenAICompatClient(LLMClient):
                     resp.close()
                 models = [m["id"] for m in data.get("data", [])]
                 return True, models
-            except Exception:
+            except (urllib.error.URLError, json.JSONDecodeError, OSError):
                 if attempt < retries - 1:
                     time.sleep(1)
                     continue
@@ -2058,7 +2060,7 @@ class OllamaClient(LLMClient):
                       f"tool_streaming={'yes' if supported else 'no'}{C.RESET}",
                       file=sys.stderr)
             return supported
-        except Exception:
+        except (urllib.error.URLError, json.JSONDecodeError, OSError):
             self._supports_tool_streaming = False
             return False
 
@@ -2261,7 +2263,7 @@ class OllamaClient(LLMClient):
             error_body = ""
             try:
                 error_body = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
+            except (IOError, AttributeError):
                 pass
             finally:
                 e.close()
@@ -3196,7 +3198,7 @@ class ReadTool(Tool):
                     "media_type": media_type,
                     "data": data,
                 })
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 return f"Error reading image file: {e}"
 
         # Check file size (100MB limit)
@@ -3214,7 +3216,7 @@ class ReadTool(Tool):
                 if b"\x00" in sample:
                     size = os.path.getsize(file_path)
                     return f"(binary file, {size} bytes)"
-        except Exception as e:
+        except OSError as e:
             return f"Error reading file: {e}"
 
         try:
@@ -3244,7 +3246,7 @@ class ReadTool(Tool):
                 result += (f"\n(truncated: showing lines {shown_start}-{shown_end} "
                            f"of {total_lines} total. Use offset/limit to read more.)")
             return result
-        except Exception as e:
+        except (OSError, UnicodeDecodeError) as e:
             return f"Error reading file: {e}"
 
     def _read_pdf(self, file_path, params):
@@ -3260,7 +3262,7 @@ class ReadTool(Tool):
                 return f"Error: PDF too large ({file_size // 1_000_000}MB). Max 100MB."
             with open(file_path, "rb") as f:
                 data = f.read()
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return f"Error reading PDF: {e}"
 
         pages_param = params.get("pages", "")
@@ -3274,7 +3276,7 @@ class ReadTool(Tool):
             # Try FlateDecode decompression
             try:
                 raw = _zlib.decompress(raw)
-            except Exception:
+            except (OSError, ValueError):
                 pass  # might not be compressed
             # Extract text from PDF operators: Tj, TJ, ', "
             text_parts = []
@@ -3350,6 +3352,33 @@ def _is_protected_path(file_path):
     return False
 
 
+def _resolve_safe_write_path(file_path):
+    """Resolve path for write operations, detecting symlinks in path components.
+
+    Returns (resolved_path, error_message). error_message is None if safe.
+    System-level symlinks (depth <= 2, e.g. /var -> /private/var on macOS) are allowed.
+    """
+    try:
+        if os.path.islink(file_path):
+            return None, f"Error: refusing to write through symlink: {file_path}"
+        resolved = os.path.realpath(file_path)
+        # Check parent directories for symlinks (skip system-level paths)
+        parent = os.path.dirname(os.path.normpath(file_path))
+        visited = set()
+        while parent and parent not in visited:
+            visited.add(parent)
+            if len(parent.rstrip(os.sep).split(os.sep)) <= 2:
+                break  # system-level paths (e.g. /tmp, /var) — skip
+            if os.path.islink(parent):
+                target = os.readlink(parent)
+                return None, (f"Error: refusing to write through symlinked directory: "
+                              f"{parent} -> {target}")
+            parent = os.path.dirname(parent)
+        return resolved, None
+    except (OSError, ValueError):
+        return None, f"Error: cannot resolve path: {file_path}"
+
+
 class WriteTool(Tool):
     name = "Write"
     description = "Write content to a file. Creates parent directories if needed."
@@ -3382,20 +3411,11 @@ class WriteTool(Tool):
         if not os.path.isabs(file_path):
             file_path = os.path.join(os.getcwd(), file_path)
 
-        # Resolve symlinks to prevent symlink-based attacks
-        # Check islink() BEFORE exists() — dangling symlinks return False for exists()
-        try:
-            if os.path.islink(file_path):
-                return f"Error: refusing to write through symlink: {file_path}"
-            # For new files: resolve parent dir to prevent symlink escape
-            resolved = os.path.realpath(file_path)
-            if os.path.exists(file_path):
-                file_path = resolved
-            else:
-                # New file: ensure resolved parent matches expected parent
-                file_path = resolved
-        except (OSError, ValueError):
-            return f"Error: cannot resolve path: {file_path}"
+        # Resolve symlinks to prevent symlink-based attacks (checks parent dirs too)
+        resolved, err = _resolve_safe_write_path(file_path)
+        if err:
+            return err
+        file_path = resolved
 
         # Block writes to protected config/permission files
         if _is_protected_path(file_path):
@@ -3411,8 +3431,8 @@ class WriteTool(Tool):
                     if len(old_content) <= 1_048_576:
                         _undo_stack.append((file_path, old_content))
                     # else: skip — file too large to store in undo stack
-                except Exception:
-                    pass
+                except (OSError, UnicodeDecodeError):
+                    pass  # non-critical: undo backup failure
 
             dirname = os.path.dirname(file_path)
             if dirname:
@@ -3423,7 +3443,7 @@ class WriteTool(Tool):
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(content)
                 os.replace(tmp_path, file_path)
-            except Exception:
+            except OSError:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
@@ -3431,12 +3451,12 @@ class WriteTool(Tool):
                 raise
             lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
             return f"Wrote {len(content)} bytes ({lines} lines) to {file_path}"
-        except Exception as e:
+        except OSError as e:
             # Clean up temp file on error
             try:
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
-            except Exception:
+            except OSError:
                 pass
             return f"Error writing file: {e}"
 
@@ -3485,13 +3505,11 @@ class EditTool(Tool):
         if not os.path.exists(file_path):
             return f"Error: file not found: {file_path}"
 
-        # Reject symlinks to prevent symlink-based attacks
-        try:
-            if os.path.islink(file_path):
-                return f"Error: refusing to edit through symlink: {file_path}"
-            file_path = os.path.realpath(file_path)
-        except (OSError, ValueError):
-            return f"Error: cannot resolve path: {file_path}"
+        # Resolve symlinks to prevent symlink-based attacks (checks parent dirs too)
+        resolved, err = _resolve_safe_write_path(file_path)
+        if err:
+            return err.replace("write through", "edit through")
+        file_path = resolved
 
         # Block edits to protected config/permission files
         if _is_protected_path(file_path):
@@ -3552,8 +3570,8 @@ class EditTool(Tool):
         try:
             if len(content) <= 1_048_576:
                 _undo_stack.append((file_path, content))
-        except Exception:
-            pass
+        except (OSError, MemoryError):
+            pass  # non-critical: undo backup failure
 
         try:
             # Atomic write: mkstemp + rename (crash-safe, no predictable name)
@@ -3563,7 +3581,7 @@ class EditTool(Tool):
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 os.replace(tmp_path, file_path)
-            except Exception:
+            except OSError:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
@@ -3598,7 +3616,7 @@ class EditTool(Tool):
             if len(diff_lines) > 40:
                 diff_text += "\n... (diff truncated)"
             return f"Edited {file_path} ({count} replacement{'s' if count > 1 else ''})\n{diff_text}"
-        except Exception as e:
+        except OSError as e:
             return f"Error writing file: {e}"
 
 
@@ -4091,7 +4109,7 @@ class WebSearchTool(Tool):
         try:
             import locale
             _loc = (locale.getlocale()[0] or os.environ.get("LANG", "")).lower()
-        except Exception:
+        except (OSError, ValueError):
             _loc = os.environ.get("LANG", "").lower()
         if "ja" in _loc:
             _ddg_locale = "&kl=jp-ja"
@@ -4311,11 +4329,31 @@ class NotebookEditTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Task Management (in-memory store)
+# Task Management (in-memory or team-persistent store)
 # ════════════════════════════════════════════════════════════════════════════════
 
 _task_store = {"next_id": 1, "tasks": {}}
 _task_store_lock = threading.Lock()  # Thread safety for parallel tool execution
+
+# Team-aware task store: when set, tasks are persisted to team's tasks.json
+_active_team_name = None   # str | None
+_active_team_manager = None  # TeamManager | None
+
+
+def _get_task_store():
+    """Get task store, loading from team file if in team context."""
+    if _active_team_name and _active_team_manager:
+        return _active_team_manager.load_tasks(_active_team_name)
+    return _task_store
+
+
+def _save_task_store(data):
+    """Save task store, persisting to team file if in team context."""
+    global _task_store
+    if _active_team_name and _active_team_manager:
+        _active_team_manager.save_tasks(_active_team_name, data)
+    else:
+        _task_store = data
 
 # Undo stack for file modifications (max 20)
 _undo_stack = collections.deque(maxlen=20)  # deque of (filepath, original_content)
@@ -4357,11 +4395,12 @@ class TaskCreateTool(Tool):
         if not description:
             return "Error: description is required"
         with _task_store_lock:
-            if len(_task_store["tasks"]) >= self.MAX_TASKS:
+            store = _get_task_store()
+            if len(store["tasks"]) >= self.MAX_TASKS:
                 return f"Error: task limit reached ({self.MAX_TASKS}). Delete old tasks before creating new ones."
-            tid = str(_task_store["next_id"])
-            _task_store["next_id"] += 1
-            _task_store["tasks"][tid] = {
+            tid = str(store["next_id"])
+            store["next_id"] += 1
+            store["tasks"][tid] = {
                 "id": tid,
                 "subject": subject,
                 "description": description,
@@ -4370,6 +4409,7 @@ class TaskCreateTool(Tool):
                 "blocks": [],
                 "blockedBy": [],
             }
+            _save_task_store(store)
         return f"Created task #{tid}: {subject}"
 
 
@@ -4383,7 +4423,8 @@ class TaskListTool(Tool):
 
     def execute(self, params):
         with _task_store_lock:
-            tasks = _task_store["tasks"]
+            store = _get_task_store()
+            tasks = store["tasks"]
             if not tasks:
                 return "No tasks."
             lines = []
@@ -4415,7 +4456,8 @@ class TaskGetTool(Tool):
         if not tid:
             return "Error: taskId is required"
         with _task_store_lock:
-            task = _task_store["tasks"].get(tid)
+            store = _get_task_store()
+            task = store["tasks"].get(tid)
             if not task:
                 return f"Error: task #{tid} not found"
             lines = [
@@ -4478,7 +4520,8 @@ class TaskUpdateTool(Tool):
         if not tid:
             return "Error: taskId is required"
         with _task_store_lock:
-            task = _task_store["tasks"].get(tid)
+            store = _get_task_store()
+            task = store["tasks"].get(tid)
             if not task:
                 return f"Error: task #{tid} not found"
 
@@ -4487,13 +4530,14 @@ class TaskUpdateTool(Tool):
                 if status not in self.VALID_STATUSES:
                     return f"Error: invalid status '{status}'. Must be: {', '.join(sorted(self.VALID_STATUSES))}"
                 if status == "deleted":
-                    del _task_store["tasks"][tid]
+                    del store["tasks"][tid]
                     # Clean up references in other tasks
-                    for other_task in _task_store["tasks"].values():
+                    for other_task in store["tasks"].values():
                         if tid in other_task.get("blocks", []):
                             other_task["blocks"].remove(tid)
                         if tid in other_task.get("blockedBy", []):
                             other_task["blockedBy"].remove(tid)
+                    _save_task_store(store)
                     return f"Deleted task #{tid}"
                 task["status"] = status
 
@@ -4511,7 +4555,7 @@ class TaskUpdateTool(Tool):
                     if node in visited:
                         continue
                     visited.add(node)
-                    t = _task_store["tasks"].get(node)
+                    t = store["tasks"].get(node)
                     if t:
                         stack.extend(t.get(direction, []))
                 return visited
@@ -4522,7 +4566,7 @@ class TaskUpdateTool(Tool):
                     return f"Error: adding block #{block_id} would create a dependency cycle"
                 if block_id not in task["blocks"]:
                     task["blocks"].append(block_id)
-                other = _task_store["tasks"].get(block_id)
+                other = store["tasks"].get(block_id)
                 if other and tid not in other["blockedBy"]:
                     other["blockedBy"].append(tid)
 
@@ -4532,10 +4576,11 @@ class TaskUpdateTool(Tool):
                     return f"Error: adding blockedBy #{blocker_id} would create a dependency cycle"
                 if blocker_id not in task["blockedBy"]:
                     task["blockedBy"].append(blocker_id)
-                other = _task_store["tasks"].get(blocker_id)
+                other = store["tasks"].get(blocker_id)
                 if other and tid not in other["blocks"]:
                     other["blocks"].append(tid)
 
+            _save_task_store(store)
         return f"Updated task #{tid}: [{task['status']}] {task['subject']}"
 
 
@@ -5304,7 +5349,7 @@ class FileWatcher:
                     with self._lock:
                         self._changes.extend(changes)
                     self._snapshots = new_snap
-            except Exception:
+            except OSError:
                 pass
 
     def get_pending_changes(self):
@@ -5331,7 +5376,7 @@ class FileWatcher:
         """Force refresh the snapshot (call after our own writes)."""
         try:
             self._snapshots = self._scan()
-        except Exception:
+        except OSError:
             pass
 
 
@@ -5522,6 +5567,270 @@ class ParallelAgentTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Teams — Multi-agent coordination with shared task lists and messaging
+# ════════════════════════════════════════════════════════════════════════════════
+
+class TeamManager:
+    """Manages team lifecycle: creation, member registration, config persistence.
+
+    Teams are stored at ~/.config/vibe-local/teams/{team-name}/config.json
+    with shared task lists at ~/.config/vibe-local/teams/{team-name}/tasks.json
+    """
+
+    def __init__(self, config_dir):
+        self._teams_dir = os.path.join(config_dir, "teams")
+        os.makedirs(self._teams_dir, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _team_dir(self, team_name):
+        candidate = os.path.realpath(os.path.join(self._teams_dir, team_name))
+        base = os.path.realpath(self._teams_dir)
+        if not (candidate.startswith(base + os.sep) or candidate == base):
+            raise ValueError(f"Invalid team name: {team_name}")
+        return candidate
+
+    def _config_path(self, team_name):
+        return os.path.join(self._team_dir(team_name), "config.json")
+
+    def _tasks_path(self, team_name):
+        return os.path.join(self._team_dir(team_name), "tasks.json")
+
+    def create_team(self, team_name, description=""):
+        """Create a new team. Returns team config dict."""
+        with self._lock:
+            tdir = self._team_dir(team_name)
+            if os.path.exists(self._config_path(team_name)):
+                raise ValueError(f"Team '{team_name}' already exists")
+            os.makedirs(tdir, exist_ok=True)
+            config = {
+                "team_name": team_name,
+                "description": description,
+                "members": [],
+                "created": datetime.now().isoformat(),
+            }
+            self._write_json(self._config_path(team_name), config)
+            # Initialize empty task store
+            self._write_json(self._tasks_path(team_name), {"next_id": 1, "tasks": {}})
+            return config
+
+    def delete_team(self, team_name):
+        """Delete a team and its data."""
+        with self._lock:
+            tdir = self._team_dir(team_name)
+            if os.path.isdir(tdir):
+                shutil.rmtree(tdir)
+
+    def get_team(self, team_name):
+        """Get team config or None."""
+        path = self._config_path(team_name)
+        if not os.path.exists(path):
+            return None
+        return self._read_json(path)
+
+    def list_teams(self):
+        """List all team names."""
+        if not os.path.isdir(self._teams_dir):
+            return []
+        return [d for d in os.listdir(self._teams_dir)
+                if os.path.isfile(os.path.join(self._teams_dir, d, "config.json"))]
+
+    def add_member(self, team_name, name, agent_id, agent_type="full"):
+        """Add a member to a team. Returns updated config."""
+        with self._lock:
+            config = self._read_json(self._config_path(team_name))
+            if any(m["name"] == name for m in config["members"]):
+                raise ValueError(f"Member '{name}' already exists in team '{team_name}'")
+            config["members"].append({
+                "name": name,
+                "agentId": agent_id,
+                "agentType": agent_type,
+            })
+            self._write_json(self._config_path(team_name), config)
+            return config
+
+    def remove_member(self, team_name, name):
+        """Remove a member from a team."""
+        with self._lock:
+            config = self._read_json(self._config_path(team_name))
+            config["members"] = [m for m in config["members"] if m["name"] != name]
+            self._write_json(self._config_path(team_name), config)
+
+    # --- Task persistence for teams ---
+
+    def load_tasks(self, team_name):
+        """Load task store from team's tasks.json."""
+        path = self._tasks_path(team_name)
+        if not os.path.exists(path):
+            return {"next_id": 1, "tasks": {}}
+        return self._read_json(path)
+
+    def save_tasks(self, team_name, task_data):
+        """Save task store to team's tasks.json (atomic)."""
+        self._write_json(self._tasks_path(team_name), task_data)
+
+    def claim_task(self, team_name, agent_name):
+        """Atomically claim the next available task. Returns task dict or None."""
+        with self._lock:
+            task_data = self.load_tasks(team_name)
+            tasks = task_data.get("tasks", {})
+            for tid, t in sorted(tasks.items(),
+                                 key=lambda x: int(x[0]) if x[0].isdigit() else float('inf')):
+                if t["status"] != "pending" or t.get("owner"):
+                    continue
+                open_blockers = [b for b in t.get("blockedBy", [])
+                                 if b in tasks and tasks[b]["status"] != "completed"]
+                if open_blockers:
+                    continue
+                t["owner"] = agent_name
+                t["status"] = "in_progress"
+                t["id"] = tid
+                self._write_json(self._tasks_path(team_name), task_data)
+                return t
+        return None
+
+    def complete_task(self, team_name, task_id):
+        """Atomically mark a task as completed."""
+        with self._lock:
+            task_data = self.load_tasks(team_name)
+            t = task_data["tasks"].get(task_id)
+            if t:
+                t["status"] = "completed"
+                self._write_json(self._tasks_path(team_name), task_data)
+
+    @staticmethod
+    def _read_json(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _write_json(path, data):
+        """Atomic JSON write via temp file + rename."""
+        dirname = os.path.dirname(path)
+        fd, tmp = tempfile.mkstemp(dir=dirname, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+class Message:
+    """A message in the inter-agent message bus."""
+    __slots__ = ("sender", "recipient", "content", "msg_type", "request_id", "timestamp", "msg_id")
+
+    def __init__(self, sender, recipient, content, msg_type="message", request_id=None):
+        self.sender = sender
+        self.recipient = recipient  # None = broadcast
+        self.content = content
+        self.msg_type = msg_type  # message, broadcast, shutdown_request, shutdown_response
+        self.request_id = request_id
+        self.timestamp = time.time()
+        self.msg_id = uuid.uuid4().hex[:12]
+
+    def to_dict(self):
+        return {
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "content": self.content,
+            "msg_type": self.msg_type,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp,
+            "msg_id": self.msg_id,
+        }
+
+
+class MessageBus:
+    """Thread-safe inter-agent message bus using queue.Queue.
+
+    Each registered agent has its own queue. Messages are routed by recipient name.
+    Supports DM, broadcast, and shutdown protocol.
+    """
+
+    def __init__(self):
+        self._queues = {}  # agent_name -> queue.Queue
+        self._lock = threading.Lock()
+
+    def register(self, agent_name):
+        """Register an agent to receive messages."""
+        with self._lock:
+            if agent_name not in self._queues:
+                self._queues[agent_name] = queue.Queue()
+
+    def unregister(self, agent_name):
+        """Unregister an agent."""
+        with self._lock:
+            self._queues.pop(agent_name, None)
+
+    def send(self, sender, recipient, content, msg_type="message"):
+        """Send a direct message. Returns msg_id."""
+        with self._lock:
+            q = self._queues.get(recipient)
+            if q is None:
+                raise ValueError(f"Unknown recipient: {recipient}")
+        msg = Message(sender, recipient, content, msg_type)
+        q.put(msg)
+        return msg.msg_id
+
+    def broadcast(self, sender, content):
+        """Send message to ALL registered agents except sender. Returns msg_id."""
+        msg_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            recipients = [name for name in self._queues if name != sender]
+        for name in recipients:
+            msg = Message(sender, name, content, "broadcast")
+            msg.msg_id = msg_id
+            with self._lock:
+                q = self._queues.get(name)
+            if q:
+                q.put(msg)
+        return msg_id
+
+    def receive(self, agent_name, block=False, timeout=None):
+        """Receive next message for agent. Returns Message or None."""
+        with self._lock:
+            q = self._queues.get(agent_name)
+        if q is None:
+            return None
+        try:
+            return q.get(block=block, timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def shutdown_request(self, sender, recipient):
+        """Send a shutdown request. Returns request_id."""
+        req_id = uuid.uuid4().hex[:12]
+        msg = Message(sender, recipient, "Shutdown requested", "shutdown_request", req_id)
+        with self._lock:
+            q = self._queues.get(recipient)
+        if q:
+            q.put(msg)
+        return req_id
+
+    def shutdown_response(self, agent_name, request_id, approve, reason=""):
+        """Respond to a shutdown request."""
+        content = f"Shutdown {'approved' if approve else 'rejected'}"
+        if reason:
+            content += f": {reason}"
+        # Send response to the original requester (typically team lead)
+        with self._lock:
+            for name, q in self._queues.items():
+                if name != agent_name:
+                    msg = Message(agent_name, name, content, "shutdown_response", request_id)
+                    q.put(msg)
+
+    def pending_count(self, agent_name):
+        """Number of pending messages for an agent."""
+        with self._lock:
+            q = self._queues.get(agent_name)
+        return q.qsize() if q else 0
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Tool Registry
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5555,6 +5864,392 @@ class ToolRegistry:
                     AskUserQuestionTool]:
             self.register(cls())
         return self
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TeamAgent — Agent that participates in a team with idle/wake-up lifecycle
+# ════════════════════════════════════════════════════════════════════════════════
+
+_team_agent_semaphore = threading.Semaphore(3)  # limit concurrent LLM requests
+
+
+class TeamAgent:
+    """A team member agent that runs in its own thread with idle/wake-up lifecycle.
+
+    Lifecycle: spawn → [task execution → idle → message/task → execution]* → shutdown
+    """
+
+    HARD_MAX_TURNS = 50
+    READ_ONLY_TOOLS = frozenset({"Read", "Glob", "Grep", "WebFetch", "WebSearch"})
+    WRITE_TOOLS = frozenset({"Bash", "Write", "Edit"})
+
+    def __init__(self, name, team_name, config, client, registry, permissions,
+                 message_bus, team_manager, agent_type="full"):
+        self.name = name
+        self.team_name = team_name
+        self._config = config
+        self._client = client
+        self._registry = registry
+        self._permissions = permissions
+        self._message_bus = message_bus
+        self._team_manager = team_manager
+        self._agent_type = agent_type
+        self._thread = None
+        self._idle = threading.Event()
+        self._shutdown = threading.Event()
+        self._alive = False
+
+        # Register with message bus
+        self._message_bus.register(self.name)
+
+        # Determine allowed tools
+        self._allowed_tools = set(self.READ_ONLY_TOOLS)
+        if agent_type == "full":
+            self._allowed_tools |= self.WRITE_TOOLS
+        # Team tools available to all agents
+        self._allowed_tools |= {"TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+                                 "SendMessage", "AskUserQuestion"}
+
+    def spawn(self):
+        """Start the agent thread. Returns the thread."""
+        self._alive = True
+        self._shutdown.clear()
+        self._idle.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True,
+                                         name=f"team-{self.name}")
+        self._thread.start()
+        return self._thread
+
+    def shutdown(self):
+        """Request graceful shutdown."""
+        self._shutdown.set()
+        self._idle.set()  # wake from idle if sleeping
+
+    @property
+    def is_idle(self):
+        return self._idle.is_set()
+
+    @property
+    def is_alive(self):
+        return self._alive and self._thread is not None and self._thread.is_alive()
+
+    def _run_loop(self):
+        """Main agent loop: execute assigned tasks, handle messages, idle between tasks."""
+        try:
+            turns_used = 0
+            while not self._shutdown.is_set() and turns_used < self.HARD_MAX_TURNS:
+                # Check for messages first
+                msg = self._check_messages()
+                if msg:
+                    if msg.msg_type == "shutdown_request":
+                        self._message_bus.shutdown_response(
+                            self.name, msg.request_id, True, "Shutting down"
+                        )
+                        break
+                    # Inject message as a task prompt
+                    if msg.content:
+                        turns_used += self._execute_task(msg.content)
+                        continue
+
+                # Try to claim a task from the team's task list
+                task = self._claim_next_task()
+                if task:
+                    prompt = f"Task #{task['id']}: {task['subject']}\n\n{task['description']}"
+                    turns_used += self._execute_task(prompt)
+                    # Mark task completed (atomic)
+                    self._team_manager.complete_task(self.team_name, task["id"])
+                    continue
+
+                # No work — go idle and wait for messages
+                self._idle.set()
+                msg = self._message_bus.receive(self.name, block=True, timeout=5)
+                self._idle.clear()
+                if msg:
+                    if msg.msg_type == "shutdown_request":
+                        self._message_bus.shutdown_response(
+                            self.name, msg.request_id, True, "Shutting down"
+                        )
+                        break
+                    if msg.content:
+                        turns_used += self._execute_task(msg.content)
+        finally:
+            self._alive = False
+            self._message_bus.unregister(self.name)
+
+    def _check_messages(self):
+        """Non-blocking message check."""
+        return self._message_bus.receive(self.name, block=False)
+
+    def _claim_next_task(self):
+        """Try to atomically claim an unblocked, unowned task."""
+        return self._team_manager.claim_task(self.team_name, self.name)
+
+    def _execute_task(self, prompt):
+        """Execute a task using the sub-agent pattern. Returns turns used."""
+        # Build tool schemas for this agent
+        schemas = [
+            s for s in self._registry.get_schemas()
+            if s.get("function", {}).get("name") in self._allowed_tools
+        ]
+
+        system_prompt = (
+            f"You are '{self.name}', a team member agent in team '{self.team_name}'. "
+            f"Complete the given task using the available tools. "
+            f"Be thorough but concise. When done, provide a clear summary.\n"
+            f"Working directory: {self._config.cwd}\n"
+            f"Platform: {platform.system().lower()}\n"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        turns = 0
+        max_turns = min(20, self.HARD_MAX_TURNS)  # per-task limit
+
+        for turn in range(max_turns):
+            # Check for shutdown between turns
+            if self._shutdown.is_set():
+                break
+
+            # Rate-limit concurrent LLM calls
+            _team_agent_semaphore.acquire()
+            try:
+                resp = self._client.chat_sync(
+                    model=self._config.sidecar_model or self._config.model,
+                    messages=messages,
+                    tools=schemas if schemas else None,
+                )
+            except (ConnectionError, TimeoutError, ValueError) as e:
+                with _print_lock:
+                    _scroll_aware_print(f"  [TeamAgent:{self.name}] LLM error: {e}")
+                break
+            finally:
+                _team_agent_semaphore.release()
+
+            turns += 1
+            text = resp.get("content", "")
+            tool_calls = resp.get("tool_calls", [])
+
+            # Check for XML tool calls (Qwen compatibility)
+            if not tool_calls and text:
+                extracted, cleaned = _extract_tool_calls_from_text(
+                    text, known_tools=list(self._allowed_tools)
+                )
+                if extracted:
+                    tool_calls = []
+                    for etc in extracted:
+                        func = etc.get("function", {})
+                        raw_args = func.get("arguments", "{}")
+                        try:
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        except json.JSONDecodeError:
+                            args = {"raw": raw_args}
+                        tool_calls.append({
+                            "id": etc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                            "name": func.get("name", ""),
+                            "arguments": args,
+                        })
+                    text = cleaned
+
+            if tool_calls:
+                oai_tool_calls = [{
+                    "id": tc["id"], "type": "function",
+                    "function": {"name": tc["name"],
+                                 "arguments": json.dumps(tc["arguments"], ensure_ascii=False)},
+                } for tc in tool_calls]
+                messages.append({"role": "assistant", "content": text or None,
+                                "tool_calls": oai_tool_calls})
+            else:
+                messages.append({"role": "assistant", "content": text or ""})
+
+            if not tool_calls:
+                break
+
+            # Execute tool calls
+            for tc in tool_calls:
+                tc_name, tc_id, tc_args = tc["name"], tc["id"], tc["arguments"]
+                if tc_name not in self._allowed_tools:
+                    messages.append({"role": "tool", "tool_call_id": tc_id,
+                                    "content": f"Error: tool '{tc_name}' not allowed"})
+                    continue
+                tool = self._registry.get(tc_name)
+                if not tool:
+                    messages.append({"role": "tool", "tool_call_id": tc_id,
+                                    "content": f"Error: unknown tool '{tc_name}'"})
+                    continue
+                if tc_name in self.WRITE_TOOLS and self._permissions is not None:
+                    if not self._permissions.check(tc_name, tc_args, None):
+                        messages.append({"role": "tool", "tool_call_id": tc_id,
+                                        "content": "Error: permission denied"})
+                        continue
+                try:
+                    output = tool.execute(tc_args)
+                except (OSError, ValueError, RuntimeError) as e:
+                    output = f"Error: {e}"
+                output_str = str(output) if output is not None else ""
+                if len(output_str) > 10000:
+                    output_str = output_str[:10000] + "\n...(truncated)"
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": output_str})
+
+            # Context window guard
+            total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+            if total_chars > 80000:
+                for i in range(2, len(messages) - 4):
+                    c = messages[i].get("content", "")
+                    if messages[i].get("role") == "tool" and isinstance(c, str) and len(c) > 500:
+                        messages[i]["content"] = c[:500] + "\n...(truncated)"
+
+        return turns
+
+
+class TeamCreateTool(Tool):
+    """Create a new team for multi-agent collaboration."""
+    name = "TeamCreate"
+    description = (
+        "Create a new team for coordinating multiple agents. "
+        "Teams share a task list and communicate via messages."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "team_name": {
+                "type": "string",
+                "description": "Name for the team (kebab-case recommended)",
+            },
+            "description": {
+                "type": "string",
+                "description": "Brief description of the team's purpose",
+            },
+        },
+        "required": ["team_name"],
+    }
+
+    def __init__(self, team_manager):
+        self._tm = team_manager
+
+    def execute(self, params):
+        team_name = params.get("team_name", "").strip()
+        if not team_name:
+            return "Error: team_name is required"
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', team_name):
+            return "Error: team_name must be alphanumeric with hyphens/underscores"
+        description = params.get("description", "")
+        try:
+            config = self._tm.create_team(team_name, description)
+            return (f"Created team '{team_name}'\n"
+                    f"  Config: {self._tm._config_path(team_name)}\n"
+                    f"  Tasks: {self._tm._tasks_path(team_name)}")
+        except ValueError as e:
+            return f"Error: {e}"
+
+
+class TeamDeleteTool(Tool):
+    """Delete a team after all members have shut down."""
+    name = "TeamDelete"
+    description = "Delete a team and its configuration. All members must be shut down first."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "team_name": {
+                "type": "string",
+                "description": "Name of the team to delete",
+            },
+        },
+        "required": ["team_name"],
+    }
+
+    def __init__(self, team_manager):
+        self._tm = team_manager
+
+    def execute(self, params):
+        team_name = params.get("team_name", "").strip()
+        if not team_name:
+            return "Error: team_name is required"
+        team = self._tm.get_team(team_name)
+        if not team:
+            return f"Error: team '{team_name}' not found"
+        if team.get("members"):
+            return (f"Error: team '{team_name}' still has {len(team['members'])} members. "
+                    f"Shut them down first.")
+        self._tm.delete_team(team_name)
+        return f"Deleted team '{team_name}'"
+
+
+class SendMessageTool(Tool):
+    """Send messages between team agents."""
+    name = "SendMessage"
+    description = (
+        "Send a message to another agent in the team. "
+        "Supports DM (type=message), broadcast (type=broadcast), "
+        "and shutdown protocol (type=shutdown_request/shutdown_response)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["message", "broadcast", "shutdown_request", "shutdown_response"],
+                "description": "Message type",
+            },
+            "recipient": {
+                "type": "string",
+                "description": "Recipient agent name (required for message, shutdown_request)",
+            },
+            "content": {
+                "type": "string",
+                "description": "Message content",
+            },
+            "request_id": {
+                "type": "string",
+                "description": "Request ID (required for shutdown_response)",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": "Approve or reject (for shutdown_response)",
+            },
+        },
+        "required": ["type"],
+    }
+
+    def __init__(self, message_bus, sender_name="main"):
+        self._bus = message_bus
+        self._sender = sender_name
+
+    def execute(self, params):
+        msg_type = params.get("type", "")
+        content = params.get("content", "")
+        recipient = params.get("recipient", "")
+
+        if msg_type == "message":
+            if not recipient:
+                return "Error: recipient is required for DM"
+            try:
+                mid = self._bus.send(self._sender, recipient, content)
+                return f"Message sent to '{recipient}' (id: {mid})"
+            except ValueError as e:
+                return f"Error: {e}"
+
+        elif msg_type == "broadcast":
+            mid = self._bus.broadcast(self._sender, content)
+            return f"Broadcast sent (id: {mid})"
+
+        elif msg_type == "shutdown_request":
+            if not recipient:
+                return "Error: recipient is required for shutdown_request"
+            req_id = self._bus.shutdown_request(self._sender, recipient)
+            return f"Shutdown request sent to '{recipient}' (request_id: {req_id})"
+
+        elif msg_type == "shutdown_response":
+            req_id = params.get("request_id", "")
+            approve = params.get("approve", True)
+            if not req_id:
+                return "Error: request_id is required for shutdown_response"
+            self._bus.shutdown_response(self._sender, req_id, approve, content)
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+
+        return f"Error: unknown message type '{msg_type}'"
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5640,7 +6335,8 @@ class PermissionMgr:
     """Manages tool execution permissions."""
 
     SAFE_TOOLS = {"Read", "Glob", "Grep", "SubAgent", "AskUserQuestion",
-                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate"}
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+                   "TeamCreate", "TeamDelete", "SendMessage"}
     ASK_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
     NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
@@ -5921,12 +6617,13 @@ class Session:
         self.messages = []
         self._client = None  # OllamaClient for sidecar summarization
         raw_id = config.session_id or (
-            datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_urlsafe(24)
         )
         # Sanitize session ID to prevent path traversal
         self.session_id = re.sub(r'[^A-Za-z0-9_\-]', '', raw_id)[:64]
         if not self.session_id:
-            self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            fallback = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_urlsafe(24)
+            self.session_id = re.sub(r'[^A-Za-z0-9_\-]', '', fallback)[:64]
         self._token_estimate = 0
         self._last_compact_msg_count = 0  # prevent infinite re-compaction
         self._just_compacted = False  # skip token reconciliation right after compaction
@@ -5965,7 +6662,7 @@ class Session:
                     json.dump(index, f, ensure_ascii=False, indent=2)
                 os.chmod(tmp, 0o600)  # restrict permissions before exposing
                 os.replace(tmp, path)
-            except Exception:
+            except OSError:
                 try:
                     os.unlink(tmp)
                 except OSError:
@@ -6301,7 +6998,7 @@ class Session:
                         f.write(json.dumps(msg, ensure_ascii=False) + "\n")
                 os.chmod(tmp_path, 0o600)  # restrict permissions before exposing
                 os.replace(tmp_path, path)  # atomic rename
-            except Exception:
+            except OSError:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
@@ -6318,7 +7015,7 @@ class Session:
             index = Session._load_project_index(self.config)
             index[cwd_key] = self.session_id
             Session._save_project_index(self.config, index)
-        except Exception:
+        except OSError:
             pass  # non-critical
 
     MAX_SESSION_FILE_SIZE = 50 * 1024 * 1024  # 50MB safety limit
@@ -6454,7 +7151,7 @@ class TUI:
                 readline.set_completer(_completer)
                 readline.set_completer_delims(" \t\n")
                 readline.parse_and_bind("tab: complete")
-            except Exception:
+            except (ImportError, AttributeError, OSError):
                 pass
 
     def _scroll_print(self, *args, **kwargs):
@@ -6583,7 +7280,7 @@ class TUI:
                 lang = ""
             if not lang:
                 lang = os.environ.get("LANG", "")
-        except Exception:
+        except (OSError, ValueError):
             lang = os.environ.get("LANG", "")
         cjk_prefixes = ("ja", "zh", "ko", "ja_JP", "zh_CN", "zh_TW", "ko_KR")
         return any(lang.startswith(p) for p in cjk_prefixes)
@@ -7668,7 +8365,7 @@ class Agent:
                                 ))
                                 self.tui.show_tool_result(tool_name, "Blocked: outside plans/ dir", True)
                                 continue
-                        except Exception:
+                        except (OSError, ValueError):
                             results.append(ToolResult(tc_id, "Error: could not validate file path in plan mode.", True))
                             self.tui.show_tool_result(tool_name, "Blocked: path validation error", True)
                             continue
@@ -7760,7 +8457,7 @@ class Agent:
                                     real_plans = os.path.realpath(os.path.join(self.config.cwd, ".vibe-local", "plans"))
                                     if fpath and os.path.realpath(fpath).startswith(real_plans + os.sep):
                                         self._active_plan_path = fpath
-                                except Exception:
+                                except OSError:
                                     pass
 
                             # Refresh file watcher snapshot after writes
@@ -7839,12 +8536,12 @@ class Agent:
                 body = ""
                 try:
                     body = e.read().decode("utf-8", errors="replace")[:200]
-                except Exception:
+                except (IOError, AttributeError):
                     pass
                 finally:
                     try:
                         e.close()
-                    except Exception:
+                    except OSError:
                         pass
                 _p(f"\n{C.RED}HTTP {e.code} {e.reason}: {body}{C.RESET}")
                 if e.code == 404:
@@ -7950,7 +8647,7 @@ def _read_latest_plan(agent):
         try:
             with open(plan_path, "r", encoding="utf-8") as f:
                 return f.read()[:8000]
-        except Exception:
+        except OSError:
             pass
     # Fallback: find newest .md in plans/
     plans_dir = os.path.join(agent.config.cwd, ".vibe-local", "plans")
@@ -7964,7 +8661,7 @@ def _read_latest_plan(agent):
             try:
                 with open(md_files[0], "r", encoding="utf-8") as f:
                     return f.read()[:8000]
-            except Exception:
+            except OSError:
                 pass
     return ""
 
@@ -8094,7 +8791,7 @@ def main():
                                 break
                 except (EOFError, KeyboardInterrupt):
                     print()
-                except Exception:
+                except (subprocess.SubprocessError, OSError):
                     pass
             if not ok:
                 sys.exit(1)
@@ -8178,6 +8875,16 @@ def main():
     registry.register(SubAgentTool(config, client, registry, permissions))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions)
     registry.register(ParallelAgentTool(coordinator))
+
+    # Initialize Teams system
+    global _active_team_manager
+    _team_manager = TeamManager(config.config_dir)
+    _active_team_manager = _team_manager
+    _message_bus = MessageBus()
+    _message_bus.register("main")  # main agent
+    registry.register(TeamCreateTool(_team_manager))
+    registry.register(TeamDeleteTool(_team_manager))
+    registry.register(SendMessageTool(_message_bus, sender_name="main"))
 
     # Initialize MCP servers
     _mcp_clients = []
@@ -8907,18 +9614,18 @@ def main():
     if HAS_READLINE:
         try:
             readline.write_history_file(config.history_file)
-        except Exception:
+        except OSError:
             pass
     # Cleanup file watcher
     try:
         agent.file_watcher.stop()
-    except Exception:
+    except OSError:
         pass
     # Cleanup MCP server subprocesses
     for mcp in _mcp_clients:
         try:
             mcp.stop()
-        except Exception:
+        except OSError:
             pass
     print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Goodbye! ✦{C.RESET}")
 
