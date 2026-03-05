@@ -6666,7 +6666,10 @@ class TUI:
                 _status_line_shown = False
 
         for chunk in response_iter:
-            choice = chunk.get("choices", [{}])[0]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue  # skip usage-only chunks (e.g. VertexAI final chunk)
+            choice = choices[0]
             delta = choice.get("delta", {})
 
             # Accumulate tool call deltas (streamed tool calling)
