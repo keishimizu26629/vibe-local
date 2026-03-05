@@ -719,7 +719,7 @@ class Config:
         self.api_key = ""
         self.base_url = ""  # custom base URL for openai-compat provider
         self.vertexai_project = ""
-        self.vertexai_location = "us-central1"
+        self.vertexai_location = "global"
         # RAG options
         self.rag = False
         self.rag_mode = "query"
