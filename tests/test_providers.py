@@ -908,3 +908,154 @@ class TestCreateClient:
         config = self._make_config(provider="openai-compat", base_url="")
         with pytest.raises(ValueError, match="openai-compat requires a base URL"):
             vc.create_client(config)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HookRunner tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestHookRunner:
+    """Tests for the HookRunner class."""
+
+    def test_no_hooks_file_allows(self, tmp_path):
+        """When hooks.json does not exist, all tools should be allowed."""
+        runner = vc.HookRunner(str(tmp_path / "nonexistent.json"))
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "rm -rf /"})
+        assert allowed is True
+        assert reason is None
+
+    def test_empty_hooks_allows(self, tmp_path):
+        """When hooks.json has no PreToolUse entries, all tools allowed."""
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({"hooks": {}}))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "ls"})
+        assert allowed is True
+
+    def test_matcher_filters_tool(self, tmp_path):
+        """Hook with matcher='Bash' should not run for 'Read' tool."""
+        script = tmp_path / "block.sh"
+        script.write_text("#!/bin/bash\nexit 2")
+        script.chmod(0o755)
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(script)}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, reason = runner.run_pre_tool_use("Read", {"file_path": "/etc/passwd"})
+        assert allowed is True
+
+    def test_script_exit_0_allows(self, tmp_path):
+        """Script returning exit 0 should allow execution."""
+        script = tmp_path / "allow.sh"
+        script.write_text("#!/bin/bash\nexit 0")
+        script.chmod(0o755)
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(script)}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "ls -la"})
+        assert allowed is True
+        assert reason is None
+
+    def test_script_exit_2_blocks(self, tmp_path):
+        """Script returning exit 2 should block execution."""
+        script = tmp_path / "deny.sh"
+        script.write_text('#!/bin/bash\necho "Dangerous command" >&2\nexit 2')
+        script.chmod(0o755)
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(script)}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "rm -rf /"})
+        assert allowed is False
+        assert "Dangerous command" in reason
+
+    def test_script_receives_json_payload(self, tmp_path):
+        """Script should receive correct JSON on stdin."""
+        script = tmp_path / "check.sh"
+        output_file = tmp_path / "received.json"
+        script.write_text(f'#!/bin/bash\ncat > {output_file}\nexit 0')
+        script.chmod(0o755)
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": str(script)}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        runner.run_pre_tool_use("Bash", {"command": "echo hello"})
+        received = json.loads(output_file.read_text())
+        assert received["tool_name"] == "Bash"
+        assert received["tool_input"]["command"] == "echo hello"
+
+    def test_missing_script_fails_open(self, tmp_path):
+        """When script does not exist, should fail open (allow)."""
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/nonexistent/script.sh"}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "ls"})
+        assert allowed is True
+
+    def test_symlink_hooks_file_rejected(self, tmp_path):
+        """Symlinked hooks.json should be rejected for security."""
+        real_file = tmp_path / "real_hooks.json"
+        real_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "exit 2"}]
+                }]
+            }
+        }))
+        link = tmp_path / "hooks.json"
+        link.symlink_to(real_file)
+        runner = vc.HookRunner(str(link))
+        # Symlink rejected — no hooks loaded, so allow
+        allowed, reason = runner.run_pre_tool_use("Bash", {"command": "rm -rf /"})
+        assert allowed is True
+
+    def test_empty_matcher_matches_all_tools(self, tmp_path):
+        """Hook with empty matcher should run for all tools."""
+        script = tmp_path / "block_all.sh"
+        script.write_text('#!/bin/bash\necho "blocked" >&2\nexit 2')
+        script.chmod(0o755)
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": str(script)}]
+                }]
+            }
+        }))
+        runner = vc.HookRunner(str(hooks_file))
+        allowed, _ = runner.run_pre_tool_use("Write", {"file_path": "/etc/passwd"})
+        assert allowed is False
