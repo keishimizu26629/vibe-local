@@ -484,6 +484,52 @@ class TestOpenRouterClient:
         assert len(messages) == original_len
         assert messages[0]["content"] == original_content
 
+    # --- MODEL_ALIASES ---
+
+    def test_alias_qwen3_resolves(self):
+        """Short alias 'qwen3' should resolve to full model ID."""
+        client = self._make_client(model="qwen3")
+        assert client.default_model == "qwen/qwen3-coder"
+
+    def test_alias_qwen3_coder_resolves(self):
+        client = self._make_client(model="qwen3-coder")
+        assert client.default_model == "qwen/qwen3-coder"
+
+    def test_alias_qwen25_resolves(self):
+        """Short alias 'qwen2.5' should resolve to full model ID."""
+        client = self._make_client(model="qwen2.5")
+        assert client.default_model == "qwen/qwen-2.5-coder-32b-instruct"
+
+    def test_alias_qwen25_coder_resolves(self):
+        client = self._make_client(model="qwen2.5-coder")
+        assert client.default_model == "qwen/qwen-2.5-coder-32b-instruct"
+
+    def test_full_model_id_passes_through(self):
+        """Full model IDs should not be altered."""
+        client = self._make_client(model="qwen/qwen3-coder")
+        assert client.default_model == "qwen/qwen3-coder"
+
+    def test_unknown_model_passes_through(self):
+        """Non-alias model names should pass through unchanged."""
+        client = self._make_client(model="anthropic/claude-3.5-sonnet")
+        assert client.default_model == "anthropic/claude-3.5-sonnet"
+
+    def test_alias_resolved_in_chat(self):
+        """Aliases passed to chat() should be resolved."""
+        client = self._make_client(model="qwen/qwen3-coder")
+        with patch.object(
+            vc.OpenAICompatClient, "chat", return_value=iter([])
+        ) as mock_chat:
+            list(client.chat(
+                model="qwen2.5",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=SAMPLE_TOOLS,
+            ))
+            mock_chat.assert_called_once()
+            call_args = mock_chat.call_args
+            # Should be resolved to full ID and routed as non-tool model
+            assert call_args[1].get("tools") is None or call_args[0][2] is None
+
     # --- chat() routing ---
 
     def test_chat_routes_tools_for_capable_model(self):
