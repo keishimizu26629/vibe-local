@@ -760,7 +760,7 @@ class Config:
             if self.provider == "openrouter":
                 self.model = "qwen/qwen3-coder"
             elif self.provider == "vertexai":
-                self.model = "qwen3-coder-480b-a35b-instruct-maas"
+                self.model = "qwen/qwen3-coder-480b-a35b-instruct-maas"
         self._ensure_dirs()
         return self
 
@@ -1804,9 +1804,9 @@ class VertexAIClient(OpenAICompatClient):
     TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
     MODEL_ALIASES = {
-        "qwen3-coder": "qwen3-coder-480b-a35b-instruct-maas",
-        "qwen3": "qwen3-235b-a22b-instruct-2507-maas",
-        "qwen3-235b": "qwen3-235b-a22b-instruct-2507-maas",
+        "qwen3-coder": "qwen/qwen3-coder-480b-a35b-instruct-maas",
+        "qwen3": "qwen/qwen3-235b-a22b-instruct-2507-maas",
+        "qwen3-235b": "qwen/qwen3-235b-a22b-instruct-2507-maas",
     }
 
     def __init__(self, project_id, location, model, **kwargs):
