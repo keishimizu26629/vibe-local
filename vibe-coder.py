@@ -6673,7 +6673,7 @@ class TUI:
             delta = choice.get("delta", {})
 
             # Accumulate tool call deltas (streamed tool calling)
-            for tc_delta in delta.get("tool_calls", []):
+            for tc_delta in (delta.get("tool_calls") or []):
                 tc_idx = tc_delta.get("index", 0)
                 if tc_idx not in _tc_accum:
                     _tc_accum[tc_idx] = {"id": "", "function": {"name": "", "arguments": ""}}
