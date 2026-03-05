@@ -1811,8 +1811,12 @@ class VertexAIClient(OpenAICompatClient):
 
     def __init__(self, project_id, location, model, **kwargs):
         model = self.MODEL_ALIASES.get(model, model)
+        if location == "global":
+            host = "aiplatform.googleapis.com"
+        else:
+            host = f"{location}-aiplatform.googleapis.com"
         base_url = (
-            f"https://{location}-aiplatform.googleapis.com/v1"
+            f"https://{host}/v1"
             f"/projects/{project_id}/locations/{location}"
             f"/endpoints/openapi"
         )
